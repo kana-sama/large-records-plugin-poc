@@ -1,0 +1,24 @@
+name: large-records-plugin-poc
+
+dependencies:
+  - base == 4.14.3.0
+
+executables:
+  hspg-exe:
+    main: Main.hs
+    source-dirs: app
+    ghc-options:
+      - -threaded
+      - -rtsopts
+    dependencies:
+      - large-records-plugin-poc
+
+library:
+  source-dirs: src
+  dependencies:
+    - ghc
+    - lens
+    - containers
+    - mtl
+    - generic-lens
+    - uniplate
