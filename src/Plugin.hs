@@ -2,6 +2,7 @@
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE LambdaCase #-}
@@ -11,58 +12,150 @@
 {-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE ViewPatterns #-}
 
 module Plugin (plugin) where
 
-import Control.Lens
+import Control.Lens (to, use, (%=), (^.))
+import Control.Monad ((<=<))
 import Control.Monad.IO.Class (liftIO)
+import Control.Monad.State (StateT, runStateT)
 import Control.Monad.Writer (runWriterT, tell)
-import Data.Data (Data)
+import Data.Foldable (for_)
 import Data.Generics.Labels ()
 import Data.Generics.Uniplate.Data qualified as Uniplate
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.Map (Map)
 import Data.Map.Strict qualified as Map
-import Data.Set (Set)
+import Data.Maybe (fromMaybe)
 import Data.Set qualified as Set
 import Data.String (fromString)
 import GHC.Generics (Generic)
 import GHC.Hs
+import GHC.IO (unsafePerformIO)
 import GhcPlugins
-
-deriving stock instance Generic HsParsedModule
-
-deriving stock instance Generic (HsModule pass)
-
-rdrNameString :: RdrName -> String
-rdrNameString = occNameString . rdrNameOcc
-
-loc :: Traversal' (Located a) a
-loc = traverse
+import OrdList (mapOL)
+import TcRnTypes (TcGblEnv (..), TcM)
 
 plugin :: Plugin
-plugin = defaultPlugin {parsedResultAction = \_ _ -> (#hpm_module . loc) transformModule}
+plugin = defaultPlugin {renamedResultAction}
+  where
+    renamedResultAction _ env mod = do
+      (mod, env) <- runStateT (transformModule mod) env
+      pure (env, mod)
 
-transformModule :: HsModule GhcPs -> Hsc (HsModule GhcPs)
+type ModuleLRs = Map ConName LRInfo
+
+data LRInfo = LRInfo
+  { constructor :: ConName,
+    fields :: [RdrName]
+  }
+  deriving stock (Generic)
+
+type LRM = StateT TcGblEnv TcM
+
+-- | Internal plugin state, for sharing plugin results between modules
+-- TODO: use files instead of IORef, because of partial compilation
+{-# NOINLINE records #-}
+records :: IORef (Map ModuleName ModuleLRs)
+records = unsafePerformIO (newIORef Map.empty)
+
+lookupInfo :: ConName -> LRM (Maybe LRInfo)
+lookupInfo con = do
+  mods <- liftIO do readIORef records
+  case (moduleName . nameModule) con `Map.lookup` mods of
+    Nothing -> pure Nothing
+    Just recs -> pure (con `Map.lookup` recs)
+
+-- | Removes `name` mention from `dus`
+removeUse :: Name -> LRM ()
+removeUse name = do
+  #tcg_dus %= mapOL \case
+    (Just ds, us) -> (Just (delFromNameSet ds name), delFromNameSet us name)
+    (Nothing, us) -> (Nothing, delFromNameSet us name)
+
+getModuleName :: LRM ModuleName
+getModuleName = use (#tcg_mod . to moduleName)
+
+-- | Transforms declarations, expressions and patterns
+transformModule :: HsGroup GhcRn -> LRM (HsGroup GhcRn)
 transformModule mod = do
   (mod, lrs) <- transformDecls mod
-  mod <- transformConstructors lrs mod
-  mod <- transformPats lrs mod
-  pure mod
+  moduleName <- getModuleName
+  liftIO do modifyIORef' records (Map.insert moduleName lrs)
+  (transformPats <=< transformExpr) mod
 
-data RecordDecl = RecordDecl
-  { tyName :: Located RdrName,
-    args :: LHsQTyVars GhcPs,
-    conName :: RdrName,
-    conFields :: [(RdrName, HsType GhcPs)],
-    derivs :: HsDeriving GhcPs,
-    conDoc :: Maybe LHsDocString
-  }
+-- | Transforms
+--
+-- > {-# ANN type X "large-record" #-}
+-- > data X = X {a :: Int, b :: String}
+-- into
+--
+-- > newtype X = X (Int, String)
+transformDecls :: HsGroup GhcRn -> LRM (HsGroup GhcRn, ModuleLRs)
+transformDecls mod = runWriterT do
+  let annos = Set.fromList [t | LRAnno t <- hs_annds mod]
+  flip Uniplate.transformBiM mod \case
+    decl@(viewRecordDecl -> Just rec) | tyName rec `Set.member` annos -> do
+      -- Remove connection between constructor and it's fields
+      -- It ruins DRF field resolver on renaming pass
+      #tcg_field_env %= \e -> delFromNameEnv e (rec ^. #conName)
+      tell (Map.singleton (conName rec) (recordDeclToInfo rec))
+      pure (mkLRDecl rec)
+    decl -> pure decl
 
-viewRecordDecl :: TyClDecl GhcPs -> Maybe RecordDecl
+-- | Transforms expression @X{b = 1, a = 2}@ into @X (2, 1)@
+--
+-- (for @data X = X{a b :: Int}@)
+transformExpr :: HsGroup GhcRn -> LRM (HsGroup GhcRn)
+transformExpr = Uniplate.transformBiM \case
+  expr@RecordCon {rcon_con_name = L _ conName, rcon_flds = HsRecFields fields' _} ->
+    lookupInfo conName >>= \case
+      Just info -> do
+        for_ (extractFields fields') removeUse
+        let con = noLoc (HsVar NoExtField (noLoc (info ^. #constructor)))
+        let val = [noLoc (lookup field fields') | field <- info ^. #fields]
+        let tup = noLoc (ExplicitTuple NoExtField [noLoc (Present NoExtField v) | v <- val] Boxed)
+        pure (HsApp NoExtField con tup)
+      Nothing -> pure expr
+  expr -> pure expr
+  where
+    lookup field = fromMaybe (error ("No field: " ++ rdrNameString field)) . lookupRecField field
+
+-- | Transforms pattern @X{b = 1, a = 2}@ into @X (2, 1)@
+--
+-- (for @data X = X{a b :: Int}@)
+transformPats :: HsGroup GhcRn -> LRM (HsGroup GhcRn)
+transformPats = Uniplate.transformBiM \case
+  pat@(ConPatIn n@(L _ conName) (RecCon (HsRecFields fields' _))) ->
+    lookupInfo conName >>= \case
+      Just info -> do
+        for_ (extractFields fields') removeUse
+        let pat = [noLoc (lookup field fields') | field <- info ^. #fields]
+        pure (ConPatIn n (PrefixCon [noLoc (TuplePat NoExtField pat Boxed)]))
+      Nothing -> pure pat
+  pat -> pure pat
+  where
+    lookup field = fromMaybe (WildPat NoExtField) . lookupRecField field
+
+-- | Extracts all field names from @{...}@
+extractFields :: [LHsRecField GhcRn a] -> [Name]
+extractFields fields = [f | L _ HsRecField {hsRecFieldLbl = L _ FieldOcc {extFieldOcc = f}} <- fields]
+
+-- | Extact term, assigned to field @field@ in @{...}@
+lookupRecField :: RdrName -> [LHsRecField GhcRn (Located (x GhcRn))] -> Maybe (x GhcRn)
+lookupRecField field [] = Nothing
+lookupRecField field (L _ (HsRecField (L _ (FieldOcc _ (L _ field'))) arg _) : bs) | field' == field = Just (unLoc arg)
+lookupRecField field (_ : bs) = lookupRecField field bs
+
+-- Misc
+
+viewRecordDecl :: TyClDecl GhcRn -> Maybe RecordDecl
 viewRecordDecl = \case
   DataDecl
-    { tcdLName = tyName,
+    { tcdDExt = tyInfo,
+      tcdLName = L _ tyName,
       tcdTyVars = args,
       tcdFixity = Prefix,
       tcdDataDefn =
@@ -85,20 +178,20 @@ viewRecordDecl = \case
                     }
                 ]
           }
-    } -> Just RecordDecl {tyName, args, conName, conFields, derivs, conDoc}
+    } -> Just RecordDecl {tyInfo, tyName, args, conName, conFields, derivs, conDoc}
   _ -> Nothing
   where
-    mkFields :: [LConDeclField GhcPs] -> [(RdrName, HsType GhcPs)]
+    mkFields :: [LConDeclField GhcRn] -> [(RdrName, HsType GhcRn)]
     mkFields fields = do
       L _ ConDeclField {cd_fld_names = names, cd_fld_type = L _ ty} <- fields
       L _ (FieldOcc _ (L _ name)) <- names
       pure (name, ty)
 
-mkLRDecl :: RecordDecl -> TyClDecl GhcPs
-mkLRDecl RecordDecl {tyName, args, conName, conFields, derivs, conDoc} =
+mkLRDecl :: RecordDecl -> TyClDecl GhcRn
+mkLRDecl RecordDecl {tyInfo, tyName, args, conName, conFields, derivs, conDoc} =
   DataDecl
-    { tcdDExt = NoExtField,
-      tcdLName = tyName,
+    { tcdDExt = tyInfo,
+      tcdLName = noLoc tyName,
       tcdTyVars = args,
       tcdFixity = Prefix,
       tcdDataDefn =
@@ -116,7 +209,7 @@ mkLRDecl RecordDecl {tyName, args, conName, conFields, derivs, conDoc} =
                       con_forall = noLoc False,
                       con_ex_tvs = [],
                       con_mb_cxt = Nothing,
-                      con_args = PrefixCon [noLoc (HsTupleTy NoExtField HsBoxedTuple [noLoc ty | (name, ty) <- conFields])],
+                      con_args = PrefixCon [noLoc (HsTupleTy NoExtField HsBoxedTuple [noLoc ty | (_, ty) <- conFields])],
                       con_doc = conDoc
                     }
               ],
@@ -124,54 +217,28 @@ mkLRDecl RecordDecl {tyName, args, conName, conFields, derivs, conDoc} =
           }
     }
 
-pattern LRAnno :: RdrName -> AnnDecl GhcPs
-pattern LRAnno typeName <-
-  HsAnnotation _ _ (TypeAnnProvenance (L _ typeName)) (L _ (HsLit _ (HsString _ ((\name -> fromString "large-record" == name) -> True))))
+pattern LRAnno :: Name -> LAnnDecl GhcRn
+pattern LRAnno typeName <- L _ (HsAnnotation _ _ (TypeAnnProvenance (L _ typeName)) (L _ (HsLit _ (HsString _ ((\l -> fromString "large-record" == l) -> True)))))
 
-type LRs = Map RdrName RecordDecl
+deriving stock instance Generic TcGblEnv
 
-transformDecls :: HsModule GhcPs -> Hsc (HsModule GhcPs, LRs)
-transformDecls mod = runWriterT do
-  let annos = getLRAnnotations mod
-  forOf (#hsmodDecls . each . loc) mod \case
-    TyClD _ decl | unLoc (tcdLName decl) `Set.member` annos,
-                   Just rec <- viewRecordDecl decl -> do
-      liftIO do putStrLn ("Largify " ++ (rdrNameString . unLoc . tyName) rec)
-      tell (Map.singleton (conName rec) rec)
-      pure (TyClD NoExtField (mkLRDecl rec))
-    decl -> pure decl
-  where
-    getLRAnnotations :: HsModule GhcPs -> Set RdrName
-    getLRAnnotations mod = Set.fromList [t | L _ (AnnD _ (LRAnno t)) <- hsmodDecls mod]
+rdrNameString :: RdrName -> String
+rdrNameString = occNameString . rdrNameOcc
 
-transformConstructors :: LRs -> HsModule GhcPs -> Hsc (HsModule GhcPs)
-transformConstructors lrs = Uniplate.transformBiM \case
-  RecordCon {rcon_con_name = L _ conName', rcon_flds = HsRecFields fields' _}
-    | Just rec <- conName' `Map.lookup` lrs -> do
-      let con = noLoc (HsVar NoExtField (noLoc (conName rec)))
-      let val = [noLoc (lookup name fields') | (name, _) <- conFields rec]
-      let tup = noLoc (ExplicitTuple NoExtField [noLoc (Present NoExtField v) | v <- val] Boxed)
-      pure (HsApp NoExtField con tup)
-  expr -> pure expr
-  where
-    lookup field bs =
-      case lookupRecField field bs of
-        Just e -> e
-        Nothing -> error ("No field: " ++ rdrNameString field)
+type ConName = Name
 
-transformPats :: LRs -> HsModule GhcPs -> Hsc (HsModule GhcPs)
-transformPats lrs = Uniplate.transformBiM \case
-  ConPatIn n@(L _ conName') (RecCon (HsRecFields fields' _)) | Just rec <- conName' `Map.lookup` lrs -> do
-    let pat = [noLoc (lookup name fields') | (name, _) <- conFields rec]
-    pure (ConPatIn n (PrefixCon [noLoc (TuplePat NoExtField pat Boxed)]))
-  pat -> pure pat
-  where
-    lookup field bs =
-      case lookupRecField field bs of
-        Just p -> p
-        Nothing -> WildPat NoExtField
+-- | All required info about record declaration for large-record declaration construction
+data RecordDecl = RecordDecl
+  { tyInfo :: DataDeclRn,
+    tyName :: Name,
+    args :: LHsQTyVars GhcRn,
+    conName :: ConName,
+    conFields :: [(RdrName, HsType GhcRn)],
+    derivs :: HsDeriving GhcRn,
+    conDoc :: Maybe LHsDocString
+  }
+  deriving stock (Generic)
 
-lookupRecField :: RdrName -> [LHsRecField GhcPs (Located (x GhcPs))] -> Maybe (x GhcPs)
-lookupRecField field [] = Nothing
-lookupRecField field (L _ (HsRecField (L _ (FieldOcc _ (L _ field'))) arg _) : bs) | field' == field = Just (unLoc arg)
-lookupRecField field (_ : bs) = lookupRecField field bs
+recordDeclToInfo :: RecordDecl -> LRInfo
+recordDeclToInfo RecordDecl {conName, conFields} =
+  LRInfo {constructor = conName, fields = [n | (n, _) <- conFields]}

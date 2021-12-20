@@ -1,15 +1,12 @@
 name: large-records-plugin-poc
 
 dependencies:
-  - base == 4.14.3.0
+  - base == 4.14.3.0 # ghc 8.10.7
 
 executables:
-  hspg-exe:
+  large-records-plugin-poc-exe:
     main: Main.hs
     source-dirs: app
-    ghc-options:
-      - -threaded
-      - -rtsopts
     dependencies:
       - large-records-plugin-poc
 

@@ -1,22 +1,31 @@
 {-# LANGUAGE DerivingStrategies #-}
-{-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE DuplicateRecordFields #-}
 {-# OPTIONS_GHC -fplugin=Plugin #-}
 
-{-# ANN type X "large-record" #-}
-data X = X {a :: Int, b :: String}
+import Example
+
+{-# ANN type C "large-record" #-}
+data C = C {a :: Int, b :: String}
   deriving stock (Show)
 
-data Y = Y {a :: Int, b :: String}
+data D = D {a :: Int, b :: String}
   deriving stock (Show)
 
-transformX X {b = x} = X {b = x ++ "!", a = 10}
+exampleC = C {b = "hello", a = 1}
 
-transformY Y {b = x} = Y {b = x ++ "!", a = 10}
+exampleD = D {b = "hello", a = 1}
 
-exampleX = X {b = "hello", a = 1}
+transformC C {b = x} = C {b = x ++ "!", a = 10}
 
-exampleY = Y {b = "hello", a = 1}
+transformD D {b = x} = D {b = x ++ "!", a = 10}
+
+exampleB = B {b = "hello", a = 1}
+
+-- TODO: fails because of resolving fields, which were already removed
+-- transformA A {b = x} = A {b = x ++ "!", a = 10}
 
 main = do
-  print (transformX exampleX)
-  print (transformY exampleY)
+  -- print (transformA exampleA)
+  print (transformB exampleB)
+  print (transformC exampleC)
+  print (transformD exampleD)
