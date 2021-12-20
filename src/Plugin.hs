@@ -1,18 +1,12 @@
 {-# LANGUAGE BlockArguments #-}
-{-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedLabels #-}
-{-# LANGUAGE PartialTypeSignatures #-}
-{-# LANGUAGE PatternSynonyms #-}
-{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE StandaloneDeriving #-}
-{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE ViewPatterns #-}
 
 module Plugin (plugin) where
@@ -95,7 +89,7 @@ transformModule mod = do
 -- > newtype X = X (Int, String)
 transformDecls :: HsGroup GhcRn -> LRM (HsGroup GhcRn, ModuleLRs)
 transformDecls mod = runWriterT do
-  let annos = Set.fromList [t | LRAnno t <- hs_annds mod]
+  let annos = Set.fromList [t | L _ anno <- hs_annds mod, Just t <- [viewLRAnnotation anno]]
   flip Uniplate.transformBiM mod \case
     decl@(viewRecordDecl -> Just rec) | tyName rec `Set.member` annos -> do
       -- Remove connection between constructor and it's fields
@@ -217,8 +211,14 @@ mkLRDecl RecordDecl {tyInfo, tyName, args, conName, conFields, derivs, conDoc} =
           }
     }
 
-pattern LRAnno :: Name -> LAnnDecl GhcRn
-pattern LRAnno typeName <- L _ (HsAnnotation _ _ (TypeAnnProvenance (L _ typeName)) (L _ (HsLit _ (HsString _ ((\l -> fromString "large-record" == l) -> True)))))
+viewLRAnnotation :: AnnDecl GhcRn -> Maybe Name
+viewLRAnnotation = \case
+  HsAnnotation
+    _
+    _
+    (TypeAnnProvenance (L _ typeName))
+    (L _ (HsLit _ (HsString _ "large-record"))) -> Just typeName
+  _ -> Nothing
 
 deriving stock instance Generic TcGblEnv
 
